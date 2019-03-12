@@ -15,6 +15,15 @@ parser.add_argument(
    '--test', action='store_true'
 )
 
+parser.add_argument(
+   '--noweight', action='store_true'
+)
+
+parser.add_argument(
+   '--recover', action='store_true', 
+   help='recover lost best iteration due to bug'
+)
+
 args = parser.parse_args()
 
 import matplotlib.pyplot as plt
@@ -31,6 +40,8 @@ dataset = 'test' if args.test else target_dataset
 mods = get_models_dir()
 
 opti_dir = '%s/bdt_bo_%s' % (mods, args.what)
+if args.noweight:
+   opti_dir += '_noweight'
 if not os.path.isdir(opti_dir):
    os.makedirs(opti_dir)
 
@@ -43,7 +54,9 @@ features, additional = get_features(args.what)
 
 fields = features+labeling+additional
 if 'gsf_pt' not in fields : fields += ['gsf_pt']
-data = pre_process_data(dataset, fields, args.what in ['seeding', 'fullseeding'])
+data = pre_process_data(dataset, fields, 'seeding' in args.what)
+if args.noweight:
+   data.weight = 1
 
 from sklearn.model_selection import train_test_split
 train, test = train_test_split(data, test_size=0.2, random_state=42)
@@ -53,6 +66,14 @@ test.to_hdf(
    ) 
 
 train, validation = train_test_split(train, test_size=0.2, random_state=42)
+train.to_hdf(
+   '%s/nn_bo_%s_traindata.hdf' % (opti_dir, args.what),
+   'data'
+   ) 
+validation.to_hdf(
+   '%s/nn_bo_%s_valdata.hdf' % (opti_dir, args.what),
+   'data'
+   ) 
 
 import xgboost as xgb
 from sklearn.externals import joblib
@@ -63,7 +84,7 @@ def train_model(**kwargs):
    print iteration_idx
    #sanitize inputs
    kwargs['max_depth'] = int(kwargs['max_depth'])
-   kwargs['n_estimators'] = 5000
+   kwargs['n_estimators'] = 2000
 
    clf = xgb.XGBClassifier(
       objective='binary:logitraw',
@@ -84,10 +105,6 @@ def train_model(**kwargs):
       **early_stop_kwargs
       )
 
-   training_out = clf.predict_proba(validation[features].as_matrix())[:, 1]
-   auc = roc_auc_score(validation.is_e, training_out)
-   kwargs['auc'] = auc
-   
    with open('%s/pars_%d.json' % (opti_dir, iteration_idx), 'w') as jpars:
       json.dump(kwargs, jpars)
    
@@ -95,6 +112,14 @@ def train_model(**kwargs):
       clf, '%s/model_%d.pkl' % (opti_dir, iteration_idx), 
       compress=True
       )
+   try:
+      training_out = clf.predict_proba(validation[features].as_matrix())[:, 1]
+      training_out[np.isnan(training_out)] = -999 #happens rarely, but happens
+      auc = roc_auc_score(validation.is_e, training_out)
+   except:
+      set_trace()
+   kwargs['auc'] = auc
+   
    iteration_idx += 1
    return auc
 
@@ -119,6 +144,9 @@ bo = BayesianOptimization(
    verbose=1,
    checkpoints='%s/checkpoints.csv' % opti_dir
 )
+if not bo.npoints_recovered is None:
+   iteration_idx = bo.npoints_recovered
+
 bo.init(5, sampling='lhs')
 bo.maximize(5, 50)
 
@@ -131,3 +159,8 @@ with open('%s/bdt_bo.json' % opti_dir, 'w') as j:
     info['hash'] = thash
     j.write(json.dumps(info))
 
+if args.recover:
+   best_id = bo.Y.argmax()
+   iteration_idx = best_id
+   best_pars = bo.space.max_point()['max_params']
+   train_model(**best_pars)
